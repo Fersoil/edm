@@ -87,7 +87,21 @@ def training_loop(
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
     ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
+    
+    # load existing parameters into the checkpoint
+
+    net = restore_song_checkpoint("/storage/ect/checkpoint_48.pth", net, device = device)
+
+    
     ema = copy.deepcopy(net).eval().requires_grad_(False)
+    
+    
+    resume_pkl = "/storage/ect/celebahq_song.pkl"
+    
+    # dump checkpoint 
+    with open(resume_pkl, "wb") as f:
+        data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+        pickle.dump(data, f)
 
     # Resume training from previous snapshot.
     if resume_pkl is not None:
@@ -101,7 +115,7 @@ def training_loop(
         misc.copy_params_and_buffers(src_module=data['ema'], dst_module=net, require_all=False)
         misc.copy_params_and_buffers(src_module=data['ema'], dst_module=ema, require_all=False)
         del data # conserve memory
-    if resume_state_dump:
+    if False:
         dist.print0(f'Loading training state from "{resume_state_dump}"...')
         data = torch.load(resume_state_dump, map_location=torch.device('cpu'))
         misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
@@ -214,3 +228,120 @@ def training_loop(
     dist.print0('Exiting...')
 
 #----------------------------------------------------------------------------
+
+
+
+
+def restore_song_checkpoint(ckpt_dir, net, device):
+  """function loads the checkpoint from the yang song model and copies the weights into the model in EDM format. 
+
+  Args:
+      ckpt_dir (str): path to the checkpoint
+      net (_type_): Model in EDM format
+      device (_type_): device to load the model on
+
+  Returns:
+      _type_: Model in EDM format
+  """
+  loaded_state = torch.load(ckpt_dir, map_location=device)
+  shadow_ema_parameters = loaded_state['ema']["shadow_params"]
+  src_tensors = loaded_state["model"]
+  
+  # omit the first parameter - 'module.all_modules.0.W' and copy the rest
+  parameters_to_copy = [param for key, param in src_tensors.items() if "module.all_modules.0.W" not in key]
+  
+  
+  print("dzien dobry")
+  
+  for s_param, param in zip(shadow_ema_parameters, parameters_to_copy):
+      param.data.copy_(s_param.data)
+  
+  dst_tensors = net.state_dict()
+  
+  
+  selected_dst_keys = list(dst_tensors.keys())
+  selected_src_keys = list(src_tensors.keys())
+  
+  # remove some keys from the loaded state
+  keys_to_remove = ['model.map_augment.weight'] + [og_string for og_string in selected_dst_keys if "resample" in og_string]
+  for key in keys_to_remove:
+      if key in selected_dst_keys:
+          selected_dst_keys.remove(key)
+  
+  # match attention blocks
+  attention_blocks_src = [og_string for og_string in src_tensors.keys() if "NIN" in og_string]
+  attention_blocks_qkv_dst = [og_string for og_string in dst_tensors.keys() if "qkv" in og_string]
+  attention_blocks_proj_dst = [og_string for og_string in dst_tensors.keys() if "proj" in og_string]
+  
+  attention_blocks_num = len(attention_blocks_qkv_dst) // 2 
+  
+  for attention_block in range(attention_blocks_num):
+      # attention block in yang song are organized in order [NNI0.W, NNI0.b, NNI1.W, NNI1.b, NNI2.W, NNI2.b, NNI3.W, NNI3.b]
+      # where NNI3 corresponds to projection the remaining linear blocks corresponds to qkv
+      # match qkv
+      qkv_id_src_weight = attention_block * 2
+      qkv_id_src_bias = attention_block * 2 + 1
+      
+      NIN_weights = [attention_block * 8, attention_block * 8 + 2, attention_block * 8 + 4]
+      NIN_bias = [attention_block * 8 + 1, attention_block * 8 + 3, attention_block * 8 + 5]
+      
+      NIN_keys_weight = [attention_blocks_src[src_key] for src_key in NIN_weights]
+      NIN_keys_bias = [attention_blocks_src[src_key] for src_key in NIN_bias]
+      
+      num_heads = src_tensors[NIN_keys_weight[0]].shape[0]
+      batch_size = src_tensors[NIN_keys_weight[0]].shape[1]
+      
+      NIN_tensor_weight = torch.cat([src_tensors[src_key].T.unsqueeze(2) for src_key in NIN_keys_weight], dim=2).permute(0, 2, 1).reshape(num_heads * 3, batch_size)
+      NIN_tensor_bias = torch.stack([src_tensors[src_key] for src_key in NIN_keys_bias], dim=1).reshape(-1)
+      
+      
+      try:
+          dst_tensors[attention_blocks_qkv_dst[qkv_id_src_weight]].copy_(NIN_tensor_weight.unsqueeze(2).unsqueeze(2))
+      except Exception as e:
+          print(f"Error copying {NIN_keys_weight} to {attention_blocks_qkv_dst[qkv_id_src_weight]}: {e}")
+      
+      
+      try:
+          dst_tensors[attention_blocks_qkv_dst[qkv_id_src_bias]].copy_(NIN_tensor_bias)
+      except Exception as e:
+          print(f"Error copying {NIN_keys_bias} to {attention_blocks_qkv_dst[qkv_id_src_bias]}: {e}")
+      
+      
+      # match projection
+      projection_id_src_weight = attention_block * 8 + 6
+      projection_id_src_bias = attention_block * 8 + 7
+      
+      projection_id_dst_weight = attention_block * 2
+      projection_id_dst_bias = attention_block * 2 + 1
+      
+      
+      
+      dst_key = attention_blocks_proj_dst[projection_id_dst_weight]
+      src_key = attention_blocks_src[projection_id_src_weight]                
+      try:
+          dst_tensors[dst_key].copy_(src_tensors[src_key].T.unsqueeze(2).unsqueeze(2))
+      except Exception as e:
+          print(f"Error copying {src_key} to {dst_key}: {e}")
+          
+      
+      dst_key = attention_blocks_proj_dst[projection_id_dst_bias]
+      src_key = attention_blocks_src[projection_id_src_bias]                
+      try:
+          dst_tensors[dst_key].copy_(src_tensors[src_key])
+      except Exception as e:
+          print(f"Error copying {src_key} to {dst_key}: {e}")
+  
+  for key in attention_blocks_src:
+      selected_src_keys.remove(key)
+  for key in attention_blocks_qkv_dst + attention_blocks_proj_dst:
+      selected_dst_keys.remove(key)          
+  
+  assert len(selected_src_keys) == len(selected_dst_keys)
+  # iterate over all the keys in the loaded state
+  for src_key, dst_key in zip(selected_src_keys, selected_dst_keys):
+      try:
+          dst_tensors[dst_key].copy_(src_tensors[src_key])
+      except Exception as e:
+          raise ValueError(f"Error copying {src_key} to {dst_key}: {e}")
+          
+  return net
